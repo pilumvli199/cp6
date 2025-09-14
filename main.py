@@ -1,10 +1,11 @@
-# main.py - Binance-only Crypto Bot (full updated)
+# main.py - Binance-only Crypto Bot (updated: trigger matching + parsed signals)
 # - Fetches spot, candles, OI from Binance
 # - Runs OpenAI GPT-4o-mini analysis
 # - Sends deduped Telegram snapshots
-# - Keyword-based immediate alerts (parsed per-symbol)
+# - Keyword-based immediate alerts parsed per-symbol
 # - Local candlestick heuristics (doji, hammer, engulfing, shooting star)
 # - Numeric change alerts (price% and OI%)
+# - Trigger matching: if OpenAI mentions a trigger price and current price meets condition -> immediate alert
 
 import os
 import asyncio
@@ -362,6 +363,61 @@ async def check_and_send_alerts(session, market_map, candle_map, analysis_text):
         msg = "⚠️ *Parsed Signals from OpenAI Analysis*\n" + "\n".join(messages)
         await _really_send_telegram(session, msg)
 
+    # --- START: actionable trigger evaluation (compare parsed triggers with current price) ---
+    trigger_alerts = []
+    for s in SYMBOLS:
+        info = sym_signals.get(s, {})
+        triggers = info.get("triggers", [])
+        if not triggers:
+            continue
+        cur = market_map.get(s) or {}
+        cur_price = None
+        try:
+            cur_price = float(cur.get("price")) if cur.get("price") is not None else None
+        except:
+            cur_price = None
+        for t in triggers:
+            t = t.strip().lower()
+            # comparator forms: >, <, >=, <=
+            m = re.match(r'^(>=|<=|>|<)\s*([0-9]+(?:\.[0-9]+)?)$', t)
+            if m:
+                comp, num = m.group(1), float(m.group(2))
+                if cur_price is not None:
+                    ok = False
+                    if comp == '>' and cur_price > num: ok = True
+                    if comp == '>=' and cur_price >= num: ok = True
+                    if comp == '<' and cur_price < num: ok = True
+                    if comp == '<=' and cur_price <= num: ok = True
+                    if ok:
+                        trigger_alerts.append(f"{s}: current {cur_price} {comp} {num} (trigger matched)")
+                continue
+            # verbal style: 'break above 4674.35' etc.
+            m2 = re.search(r'(break|buy|sell).{0,15}?(above|over|>)\s*([0-9]+(?:\.[0-9]+)?)', t)
+            if m2:
+                verb, pos, num = m2.group(1), m2.group(2), float(m2.group(3))
+                if cur_price is not None and cur_price > num:
+                    trigger_alerts.append(f"{s}: current {cur_price} > {num} → triggered ({verb} {pos})")
+                continue
+            m3 = re.search(r'(break|sell|drop|below).{0,15}?(below|under|<)\s*([0-9]+(?:\.[0-9]+)?)', t)
+            if m3:
+                verb, pos, num = m3.group(1), m3.group(2), float(m3.group(3))
+                if cur_price is not None and cur_price < num:
+                    trigger_alerts.append(f"{s}: current {cur_price} < {num} → triggered ({verb} {pos})")
+                continue
+            # fallback: bare number inference
+            m4 = re.search(r'([0-9]+(?:\.[0-9]+)?)', t)
+            if m4 and cur_price is not None:
+                num = float(m4.group(1))
+                if 'above' in t or '>' in t or 'over' in t:
+                    if cur_price > num:
+                        trigger_alerts.append(f"{s}: current {cur_price} > {num} → triggered (inferred)")
+                elif 'below' in t or '<' in t or 'under' in t or 'drop' in t:
+                    if cur_price < num:
+                        trigger_alerts.append(f"{s}: current {cur_price} < {num} → triggered (inferred)")
+    if trigger_alerts:
+        await _really_send_telegram(session, "🚨 *Trigger Alerts (OpenAI triggers matched current price)*\n" + "\n".join(trigger_alerts))
+    # --- END actionable trigger evaluation ---
+
     # 2) Numeric change alerts vs last snapshot
     last = load_last_snapshot()
     now_snapshot = {}
@@ -538,7 +594,7 @@ async def periodic_task():
             for s in SYMBOLS:
                 print(f"  {s}: price={market_map[s]['price']}  candles={len(candle_map[s])}  oi={market_map[s]['oi']}")
             analysis = await openai_analyze(market_map, candle_map)
-            # alerts: parsed OpenAI signals, numeric diffs, local candlestick patterns
+            # alerts: parsed OpenAI signals, trigger matching, numeric diffs, local patterns
             await check_and_send_alerts(session, market_map, candle_map, analysis)
             # send deduped snapshot
             await send_snapshot_message(session, market_map, candle_map, analysis)
@@ -550,7 +606,7 @@ def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[ERROR] Telegram env vars missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
         return
-    print("[INFO] Starting Binance-only bot (alerts + patterns, updated).")
+    print("[INFO] Starting Binance-only bot (alerts + patterns, trigger-match enabled).")
     try:
         asyncio.run(periodic_task())
     except KeyboardInterrupt:
