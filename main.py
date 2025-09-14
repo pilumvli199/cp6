@@ -1,11 +1,16 @@
-# main.py - Binance-only Crypto Bot with OpenAI + keyword alerts + local candlestick pattern checks
+# main.py - Binance-only Crypto Bot (full updated)
 # - Fetches spot, candles, OI from Binance
-# - Sends snapshot + OpenAI analysis to Telegram
-# - If OpenAI analysis contains signal keywords -> immediate alert
-# - Also computes simple candlestick-based patterns locally (doji, hammer, engulfing, shooting star)
-# - Dedupes Telegram messages via cooldown file
+# - Runs OpenAI GPT-4o-mini analysis
+# - Sends deduped Telegram snapshots
+# - Keyword-based immediate alerts (parsed per-symbol)
+# - Local candlestick heuristics (doji, hammer, engulfing, shooting star)
+# - Numeric change alerts (price% and OI%)
 
-import os, asyncio, time, json
+import os
+import asyncio
+import time
+import json
+import re
 from datetime import datetime
 import aiohttp
 from openai import OpenAI
@@ -13,28 +18,32 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ENV
+# -------------- Configuration (env) --------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 300))
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 MSG_COOLDOWN = int(os.environ.get("MSG_COOLDOWN", 70))
 
+ALERT_PRICE_PCT = float(os.environ.get("ALERT_PRICE_PCT", 0.01))  # 1%
+ALERT_OI_PCT = float(os.environ.get("ALERT_OI_PCT", 0.10))        # 10%
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
+# -------------- Endpoints & local paths --------------
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
 BINANCE_CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=50"
 BINANCE_OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}"
-
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
 
 STARTUP_FLAG_PATH = "/tmp/bot_startup_sent"
 LAST_MSG_PATH = "/tmp/last_msg_sent"
 LAST_SNAPSHOT_PATH = "/tmp/last_snapshot.json"
 
-# Init OpenAI client
+# -------------- Init OpenAI --------------
 client = None
 if OPENAI_API_KEY:
     try:
@@ -45,9 +54,7 @@ if OPENAI_API_KEY:
 else:
     print("[WARN] OPENAI_API_KEY not set; OpenAI analysis disabled.")
 
-# -----------------------
-# Telegram helpers
-# -----------------------
+# ---------------- Telegram helpers ----------------
 async def _really_send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[WARN] Telegram credentials missing.")
@@ -82,16 +89,14 @@ def _mark_message_sent():
     except Exception as e:
         print("[WARN] cannot write last_msg file:", e)
 
-# -----------------------
-# Binance fetch helpers
-# -----------------------
+# ---------------- Binance fetch helpers ----------------
 async def fetch_ticker(session: aiohttp.ClientSession, symbol: str):
     url = BINANCE_TICKER_URL.format(symbol=symbol)
     try:
         async with session.get(url, timeout=15) as r:
             if r.status != 200:
                 text = await r.text()
-                raise RuntimeError(f"Ticker HTTP {r.status}: {text[:200]}")
+                raise RuntimeError(f"Ticker HTTP {r.status}: {text[:300]}")
             d = await r.json()
             return {
                 "price": float(d.get("lastPrice") or 0),
@@ -109,7 +114,7 @@ async def fetch_candles(session: aiohttp.ClientSession, symbol: str):
         async with session.get(url, timeout=20) as r:
             if r.status != 200:
                 text = await r.text()
-                raise RuntimeError(f"Klines HTTP {r.status}: {text[:200]}")
+                raise RuntimeError(f"Klines HTTP {r.status}: {text[:300]}")
             data = await r.json()
             candles = [
                 {"open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])}
@@ -130,9 +135,7 @@ async def fetch_oi(session: aiohttp.ClientSession, symbol: str):
     except Exception:
         return None
 
-# -----------------------
-# Local candlestick pattern heuristics (simple)
-# -----------------------
+# ---------------- Candlestick heuristics ----------------
 def detect_candlestick_patterns_for_symbol(candles):
     if not candles or len(candles) < 2:
         return []
@@ -145,7 +148,6 @@ def detect_candlestick_patterns_for_symbol(candles):
     def is_bear(c): return c["close"] < c["open"]
     last_body = body(last)
     last_range = range_size(last)
-    prev_body = body(prev)
     # Doji
     if last_range > 0 and (last_body / last_range) < 0.15:
         patterns.append("Doji")
@@ -181,9 +183,7 @@ def detect_candlestick_patterns(candle_map):
             res[s] = []
     return res
 
-# -----------------------
-# OpenAI analysis (robust)
-# -----------------------
+# ---------------- OpenAI analysis (robust) ----------------
 async def openai_analyze(market_map, candle_map):
     if not client:
         return None
@@ -231,17 +231,21 @@ async def openai_analyze(market_map, candle_map):
         print("[ERROR] OpenAI analyze failed:", e)
         return None
 
-# -----------------------
-# Alerts: keyword detection + numeric change + local candlestick patterns
-# -----------------------
+# ---------------- Alerts: keyword detection + numeric + local patterns ----------------
 KEYWORD_LIST = [
     "breakout","breakouts","buy","sell","bullish","bearish","double bottom","double top",
     "head and shoulders","head & shoulders","flag","flags","triangle","ascending triangle",
     "descending triangle","engulfing","hammer","doji","spinning top","pullback","retest"
 ]
 
-ALERT_PRICE_PCT = float(os.environ.get("ALERT_PRICE_PCT", 0.01))   # 1%
-ALERT_OI_PCT = float(os.environ.get("ALERT_OI_PCT", 0.10))        # 10%
+# Priority mapping for deciding final signal
+_SIGNAL_PRIORITY = {
+    "sell": 3, "short": 3, "bearish": 2,
+    "buy": 3, "long": 3, "bullish": 2,
+    "double bottom": 2, "double top": 2, "head and shoulders": 2,
+    "flag": 2, "triangle": 1, "engulfing": 1,
+    "hammer": 1, "doji": 0, "spinning top": 0
+}
 
 def detect_keywords(text):
     if not text:
@@ -268,27 +272,97 @@ def save_last_snapshot(snapshot):
     except Exception as e:
         print("[WARN] save_last_snapshot:", e)
 
+# Parse OpenAI text into per-symbol sentences + triggers
+def _extract_symbol_signals(analysis_text):
+    if not analysis_text:
+        return {}
+    out = {s: {"keywords": [], "triggers": [], "text": ""} for s in SYMBOLS}
+    # split into sentences and lines
+    sentences = re.split(r'[.\n]\s*', analysis_text)
+    for sent in sentences:
+        s_lower = sent.lower()
+        for sym in SYMBOLS:
+            short = sym.split("USDT")[0].lower()
+            if short in s_lower or sym.lower() in s_lower:
+                out[sym]["text"] += (sent.strip() + ". ")
+                # keywords
+                for kw in KEYWORD_LIST:
+                    if kw in s_lower:
+                        out[sym]["keywords"].append(kw)
+                # triggers: look for numbers and comparators
+                m = re.findall(r'(break(?:s)? (?:above|below|over|under)|buy (?:above|if above|>|>=)|sell (?:below|if below|<|<=))\s*([0-9]{1,7}(?:\.[0-9]+)?)', s_lower)
+                m2 = re.findall(r'([<>]=?)\s*([0-9]{1,7}(?:\.[0-9]+)?)', s_lower)
+                for match in m:
+                    out[sym]["triggers"].append(" ".join(match).strip())
+                for comp, num in m2:
+                    out[sym]["triggers"].append(f"{comp}{num}")
+    # fallback: if none matched per-symbol, attempt to assign global mentions heuristically
+    if all(not out[s]["text"] for s in SYMBOLS):
+        for sent in sentences:
+            for s in SYMBOLS:
+                if s.split("USDT")[0].lower() in sent.lower():
+                    out[s]["text"] += sent.strip() + ". "
+                    for kw in KEYWORD_LIST:
+                        if kw in sent.lower():
+                            out[s]["keywords"].append(kw)
+    return out
+
+def _decide_final_signal(keywords):
+    if not keywords:
+        return "WAIT", 0
+    best = None
+    best_p = -1
+    for k in keywords:
+        p = _SIGNAL_PRIORITY.get(k, 0)
+        if p > best_p:
+            best_p = p
+            best = k
+    if best in ("sell","short","bearish"):
+        return "SELL", best_p
+    if best in ("buy","long","bullish","double bottom"):
+        return "BUY", best_p
+    if best in ("breakout","flag","triangle","engulfing","head and shoulders","double top"):
+        if "bullish" in keywords or "buy" in keywords or "double bottom" in keywords:
+            return "BUY", best_p
+        if "bearish" in keywords or "sell" in keywords:
+            return "SELL", best_p
+        return "WAIT", best_p
+    return "WAIT", best_p
+
 async def check_and_send_alerts(session, market_map, candle_map, analysis_text):
-    # 1) OpenAI keyword alerts
-    kws = detect_keywords(analysis_text)
-    if kws:
-        msg = "⚠️ *OpenAI Keywords Detected*: " + ", ".join(kws)
-        if analysis_text and len(analysis_text) < 800:
-            msg += "\n\nSummary:\n" + analysis_text
-        else:
-            msg += "\n\n(analysis longer - see snapshot)"
+    # 1) Parse OpenAI text into per-symbol signals and send a concise parsed message
+    sym_signals = _extract_symbol_signals(analysis_text or "")
+    messages = []
+    for s in SYMBOLS:
+        info = sym_signals.get(s, {})
+        keys = sorted(set(info.get("keywords", [])))
+        triggers = info.get("triggers", [])
+        text_snip = info.get("text", "").strip()
+        final_signal, priority = _decide_final_signal(keys)
+        if keys or triggers or text_snip:
+            line = f"*{s}* — Signal: *{final_signal}*"
+            if "bullish" in keys:
+                line += " · Bias: Bullish"
+            elif "bearish" in keys:
+                line += " · Bias: Bearish"
+            else:
+                if final_signal == "BUY":
+                    line += " · Bias: Bullish"
+                elif final_signal == "SELL":
+                    line += " · Bias: Bearish"
+                else:
+                    line += " · Bias: Neutral"
+            if triggers:
+                line += " · Trigger: " + ", ".join(triggers[:3])
+            patterns = [k for k in keys if k not in ("buy","sell","bullish","bearish")]
+            if patterns:
+                line += " · Pattern: " + ", ".join(patterns[:3])
+            messages.append(line)
+    if messages:
+        msg = "⚠️ *Parsed Signals from OpenAI Analysis*\n" + "\n".join(messages)
         await _really_send_telegram(session, msg)
 
-    # 2) Local candlestick pattern alerts
-    local_patterns = detect_candlestick_patterns(candle_map)
-    pattern_msgs = []
-    for s, pats in local_patterns.items():
-        if pats:
-            pattern_msgs.append(f"{s}: " + ", ".join(pats))
-    if pattern_msgs:
-        await _really_send_telegram(session, "🔔 *Local Candlestick Patterns:*\n" + "\n".join(pattern_msgs))
-
-    # 3) Numeric change alerts vs last snapshot
+    # 2) Numeric change alerts vs last snapshot
     last = load_last_snapshot()
     now_snapshot = {}
     alerts = []
@@ -302,7 +376,6 @@ async def check_and_send_alerts(session, market_map, candle_map, analysis_text):
         except:
             now_oi = None
         now_snapshot[s] = {"price": now_price, "oi": now_oi}
-
         prev = last.get(s)
         if prev:
             try:
@@ -323,15 +396,21 @@ async def check_and_send_alerts(session, market_map, candle_map, analysis_text):
                         alerts.append(f"{s}: OI {dirc} {oi_pct*100:.2f}% ({prev_oi} → {now_oi})")
             except Exception:
                 pass
-
     save_last_snapshot(now_snapshot)
     if alerts:
         text = "📣 *Numeric Alerts*\n" + "\n".join(alerts)
         await _really_send_telegram(session, text)
 
-# -----------------------
-# Snapshot builder + dedupe
-# -----------------------
+    # 3) Local candlestick patterns
+    local_patterns = detect_candlestick_patterns(candle_map)
+    pattern_msgs = []
+    for s, pats in local_patterns.items():
+        if pats:
+            pattern_msgs.append(f"{s}: " + ", ".join(pats))
+    if pattern_msgs:
+        await _really_send_telegram(session, "🔔 *Local Candlestick Patterns:*\n" + "\n".join(pattern_msgs))
+
+# ---------------- Snapshot builder + dedupe ----------------
 def _clean_analysis_text(text, max_lines=5):
     if not text:
         return ""
@@ -350,7 +429,7 @@ def _clean_analysis_text(text, max_lines=5):
         short.append(ln)
         if len(short) >= max_lines:
             break
-    return "\\n".join(short)
+    return "\n".join(short)
 
 async def send_snapshot_message(session, market_map, candle_map, analysis_raw):
     if _recent_message_sent():
@@ -364,17 +443,15 @@ async def send_snapshot_message(session, market_map, candle_map, analysis_raw):
         else:
             header_lines.append(f"*{s}*: DATA_MISSING")
     analysis_clean = _clean_analysis_text(analysis_raw, max_lines=5)
-    msg = f"*Snapshot (UTC {datetime.utcnow().strftime('%H:%M')})*\\n" + "\\n".join(header_lines)
+    msg = f"*Snapshot (UTC {datetime.utcnow().strftime('%H:%M')})*\n" + "\n".join(header_lines)
     if analysis_clean:
-        msg += "\\n\\n🧠 Analysis:\\n" + analysis_clean
+        msg += "\n\n🧠 Analysis:\n" + analysis_clean
     sent = await _really_send_telegram(session, msg)
     if sent:
         _mark_message_sent()
     return sent
 
-# -----------------------
-# Startup helpers and main loop
-# -----------------------
+# ---------------- Startup helpers & main loop ----------------
 async def send_startup_once(session):
     if os.path.exists(STARTUP_FLAG_PATH):
         print("[INFO] startup flag exists, skipping startup alert for this container.")
@@ -412,9 +489,9 @@ async def send_startup_test(session):
             header.append(f"*{s}*: {d['price']} (24hVol={d['volume']}, OI={d.get('oi','NA')})")
         else:
             header.append(f"*{s}*: DATA_MISSING")
-    msg = "*Startup test — forced snapshot*\\n" + "\\n".join(header)
+    msg = "*Startup test — forced snapshot*\n" + "\n".join(header)
     if analysis:
-        msg += "\\n\\n🧠 Analysis:\\n" + _clean_analysis_text(analysis, max_lines=6)
+        msg += "\n\n🧠 Analysis:\n" + _clean_analysis_text(analysis, max_lines=6)
     await _really_send_telegram(session, msg)
 
 async def periodic_task():
@@ -461,18 +538,19 @@ async def periodic_task():
             for s in SYMBOLS:
                 print(f"  {s}: price={market_map[s]['price']}  candles={len(candle_map[s])}  oi={market_map[s]['oi']}")
             analysis = await openai_analyze(market_map, candle_map)
-            # alerts: keywords & local candlestick & numeric diffs
+            # alerts: parsed OpenAI signals, numeric diffs, local candlestick patterns
             await check_and_send_alerts(session, market_map, candle_map, analysis)
             # send deduped snapshot
             await send_snapshot_message(session, market_map, candle_map, analysis)
             elapsed = time.time() - start
             await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
 
+# ---------------- Entrypoint ----------------
 def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[ERROR] Telegram env vars missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
         return
-    print("[INFO] Starting Binance-only bot (alerts + local patterns)...")
+    print("[INFO] Starting Binance-only bot (alerts + patterns, updated).")
     try:
         asyncio.run(periodic_task())
     except KeyboardInterrupt:
